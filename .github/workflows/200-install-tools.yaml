@@ -81,8 +81,8 @@ jobs:
             --set oras.authProviders.azureWorkloadIdentityEnabled=true \
             --set azureWorkloadIdentity.clientId=${CLIENT_ID}
 
-      - name: Sleep for 60 seconds - Wait till ratify is installed
-        run: sleep 60s
+      - name: Sleep for 120 seconds - Wait till ratify is installed
+        run: sleep 120s
         shell: bash
 
       - uses: Azure/k8s-deploy@v4
