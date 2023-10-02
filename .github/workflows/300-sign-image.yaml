@@ -1,0 +1,149 @@
+name: 300-sign-image.yaml
+
+on:
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: 'rg-software-supply-chain-security'
+  CERT_NAME: 'dewolfs-notation-cert2023'
+  TRUST_STORE: 'dewolfs'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  sign-image:
+    name: sign-image
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitHub Actions 
+        uses: actions/checkout@v4
+  
+      - name: Az CLI login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get vault details
+        run: |
+          VAULT_NAME=$(az keyvault list --resource-group ${{ env.RESOURCE_GROUP }} --query [].name --output tsv)
+          echo The VAULT_NAME is $VAULT_NAME
+          echo "VAULT_NAME=$VAULT_NAME" >> "$GITHUB_ENV"
+
+          KEY_ID=$(az keyvault certificate show --name ${{ env.CERT_NAME }} --vault-name  $VAULT_NAME --query kid --output tsv)
+          echo The KEY_ID is $KEY_ID
+          echo "KEY_ID=$KEY_ID" >> "$GITHUB_ENV"
+
+      - name: Get registry details
+        run: |
+          REGISTRY_NAME=$(az acr list --resource-group rg-software-supply-chain-security --query [].name -o tsv)
+          echo The REGISTRY_NAME is $REGISTRY_NAME
+          echo "REGISTRY_NAME=$REGISTRY_NAME" >> "$GITHUB_ENV"
+
+      - name: Push container image to registry
+        run: |
+          az acr login --name ${{ env.REGISTRY_NAME }}.azurecr.io
+          docker pull hello-world:latest
+          docker tag hello-world:latest ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world:${{ github.sha }}
+          docker push ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world:${{ github.sha }}
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@0.12.0
+        with:
+          image-ref: '${{ env.REGISTRY_NAME }}.azurecr.io/hello-world:${{ github.sha }}'
+          format: 'table'
+          ignore-unfixed: true
+          vuln-type: 'os,library'
+
+      - name: setup Notation CLI
+        uses: notaryproject/notation-action/setup@v1
+        with:
+          version: '1.0.0'
+
+      - name: Get container image digest
+        run: |
+          IMAGE_DIGEST=$(docker buildx imagetools inspect ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world:${{ github.sha }} --format "{{json .Manifest}}" | jq -r .digest)
+          echo The image digest is $IMAGE_DIGEST
+          echo "IMAGE_DIGEST=$IMAGE_DIGEST" >> "$GITHUB_ENV"
+
+      - name: Sign released artifact with notation-azure-kv plugin
+        uses: notaryproject/notation-action/sign@v1
+        env:
+          NOTATION_EXPERIMENTAL: 1  # this is required by Notation to use Referrers API
+        with:
+          allow_referrers_api: 'true'
+          plugin_name: azure-kv
+          plugin_url: https://github.com/Azure/notation-azure-kv/releases/download/v1.0.1/notation-azure-kv_1.0.1_linux_amd64.tar.gz
+          plugin_checksum: f8a75d9234db90069d9eb5660e5374820edf36d710bd063f4ef81e7063d3810b
+          key_id: ${{ env.KEY_ID }}
+          target_artifact_reference: ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world@${{ env.IMAGE_DIGEST }}
+          signature_format: cose
+          plugin_config: |-
+            self_signed=true
+
+      - name: Add certificate to trust store
+        run: |
+          notationTruststoreDir=".github/truststore/x509/ca/${{ env.TRUST_STORE }}"
+          mkdir -p $notationTruststoreDir
+          az keyvault certificate download --name ${{ env.CERT_NAME }} --vault-name ${{ env.VAULT_NAME }} --file $notationTruststoreDir/selfSignedCert.pem
+          notation cert add --type ca --store ${{ env.TRUST_STORE }} $notationTruststoreDir/selfSignedCert.pem
+
+      - name: Create trust policy for verification
+        run: |
+          notationConfigDir=".github/trustpolicy"
+          mkdir -p $notationConfigDir
+          cat <<EOF > $notationConfigDir/trustpolicy.json
+          {
+          "version": "1.0",
+          "trustPolicies": [
+              {
+                  "name": "trust-policy-${{ env.TRUST_STORE }}",
+                  "registryScopes": [ "*" ],
+                  "signatureVerification": {
+                      "level" : "strict" 
+                  },
+                  "trustStores": [ "ca:${{ env.TRUST_STORE }}" ],
+                  "trustedIdentities": [
+                      "*"
+                  ]
+              }
+          ]
+          }
+          EOF
+          chmod 600 $notationConfigDir/trustpolicy.json
+
+      - name: Verify released artifact
+        uses: notaryproject/notation-action/verify@v1
+        env:
+          NOTATION_EXPERIMENTAL: 1  # this is required by Notation to use Referrers API
+        with:
+          allow_referrers_api: 'true'
+          target_artifact_reference: ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world@${{ env.IMAGE_DIGEST }}
+          trust_policy: .github/trustpolicy/trustpolicy.json
+          trust_store: .github/truststore/
+
+      - name: Generate SPDX SBOM Using Syft
+        uses: anchore/sbom-action@v0.14.3
+        with:
+          image: ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world@${{ env.IMAGE_DIGEST }}
+          artifact-name: sbom.spdx.json
+          format: spdx-json
+          output-file: /tmp/sbom.spdx.json
+  
+      - name: Install ORAS
+        uses: oras-project/setup-oras@v1
+        with:
+          version: 1.1.0
+  
+      - name: Attach SBOM to the image in the registry
+        run: |
+          oras attach ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world@${{ env.IMAGE_DIGEST }} \
+            --artifact-type sbom/example \
+            /tmp/sbom.spdx.json:application/json --disable-path-validation
+  
+      - name: View the graph
+        run: |
+          oras discover -o tree ${{ env.REGISTRY_NAME }}.azurecr.io/hello-world@${{ env.IMAGE_DIGEST }}

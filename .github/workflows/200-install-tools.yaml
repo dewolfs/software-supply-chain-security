@@ -1,0 +1,94 @@
+name: 200-install-tools.yaml
+
+on:
+  workflow_dispatch:
+
+env:
+  RESOURCE_GROUP: 'rg-software-supply-chain-security'
+  CLUSTER_NAME: 'aks-supply-sec-01'
+  CERT_NAME: 'dewolfs-notation-cert2023'
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  install-tools:
+    name: install-tools
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitHub Actions
+        uses: actions/checkout@v2
+    
+      - name: Az CLI login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Get VAULT_URI and CLIENT_ID
+        run: |
+          VAULT_URI=$(az keyvault list --resource-group ${{ env.RESOURCE_GROUP }} --query [].properties.vaultUri --output tsv)
+          echo The VAULT_URI is $VAULT_URI
+          echo "VAULT_URI=$VAULT_URI" >> "$GITHUB_ENV"
+
+          UMI_CLIENT_ID=$(az identity list --resource-group ${{ env.RESOURCE_GROUP }} --query [].clientId -o tsv)
+          echo The UMI_CLIENT_ID is $UMI_CLIENT_ID
+          echo "UMI_CLIENT_ID=$UMI_CLIENT_ID" >> "$GITHUB_ENV"
+
+      - name: Get K8s context
+        uses: azure/aks-set-context@v3
+        with:
+          resource-group: ${{ env.RESOURCE_GROUP }}
+          cluster-name: ${{ env.CLUSTER_NAME }}
+          admin: 'true'
+
+      - name: Install Gatekeeper
+        run: |
+          helm repo add gatekeeper https://open-policy-agent.github.io/gatekeeper/charts
+          helm repo update
+
+          helm install gatekeeper/gatekeeper  \
+            --name-template=gatekeeper \
+            --namespace gatekeeper-system --create-namespace \
+            --set enableExternalData=true \
+            --set validatingWebhookTimeoutSeconds=5 \
+            --set mutatingWebhookTimeoutSeconds=2
+
+      - name: Install Ratify
+        run: |
+          export VAULT_URI=${{ env.VAULT_URI }}
+          export CERT_NAME=${{ env.CERT_NAME }}
+          export TENANT_ID=${{ secrets.AZURE_TENANT_ID }}
+          export CLIENT_ID=${{ env.UMI_CLIENT_ID }}
+              
+          echo VAULT_URI is ${{ env.VAULT_URI }}
+          echo CERT_NAME is ${{ env.CERT_NAME }}
+          echo TENANT_ID is ${{ env.TENANT_ID }}
+          echo CLIENT_ID is ${{ env.UMI_CLIENT_ID }}
+          
+          helm repo add ratify https://deislabs.github.io/ratify
+          helm repo update
+
+          helm install ratify ratify/ratify --atomic \
+            --namespace gatekeeper-system --create-namespace \
+            --set featureFlags.RATIFY_CERT_ROTATION=true \
+            --set akvCertConfig.enabled=true \
+            --set akvCertConfig.vaultURI=${VAULT_URI} \
+            --set akvCertConfig.cert1Name=${CERT_NAME} \
+            --set akvCertConfig.tenantId=${TENANT_ID} \
+            --set oras.authProviders.azureWorkloadIdentityEnabled=true \
+            --set azureWorkloadIdentity.clientId=${CLIENT_ID}
+
+      - name: Sleep for 30 seconds - Wait till ratify is installed
+        run: sleep 30s
+        shell: bash
+
+      - uses: Azure/k8s-deploy@v4
+        name: Enforce Gatekeeper policy to allow only signed images can be deployed on AKS
+        with:
+          namespace: 'gatekeeper-system'
+          manifests: |
+            manifests/template.yaml
+            manifests/constraint.yaml

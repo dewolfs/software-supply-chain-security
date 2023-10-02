@@ -1,0 +1,121 @@
+name: 100-infra-deploy.yaml
+
+on:
+  workflow_dispatch:
+
+env:
+  LOCATION: 'germanywestcentral'
+  RESOURCE_GROUP: 'rg-software-supply-chain-security'
+  REGISTRY_NAME: 'acrweuscs001'
+  USER_MANAGED_ID_NAME: 'umi-aks-supply-sec-01'
+  CLUSTER_NAME: 'aks-supply-sec-01'
+  KEYVAULT_ADMINS_OBJ_ID: '59b8d021-d9ce-4799-83c0-a7a59f91ff06'
+  CERT_NAME: 'dewolfs-notation-cert2023'
+  
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  infra-rg:
+    name: infra-rg
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout GitHub Actions
+        uses: actions/checkout@v2
+
+      - name: Az CLI login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create resource groups
+        run: |
+          az group create --location ${{ env.LOCATION }} --name ${{ env.RESOURCE_GROUP }}
+
+  infra-aks:
+    name: infra-aks
+    runs-on: ubuntu-latest
+    needs: infra-rg
+    steps:
+      - name: Checkout GitHub Actions
+        uses: actions/checkout@v2
+
+      - name: Az CLI login
+        uses: azure/login@v1
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      - name: Create user managed identity
+        run: |
+          az identity create --name ${{ env.USER_MANAGED_ID_NAME }} --resource-group ${{ env.RESOURCE_GROUP }}
+          UMI_ID=$(az identity list --resource-group ${{ env.RESOURCE_GROUP }} --query [].id -o tsv)
+          echo The UMI_ID is $UMI_ID
+          echo "UMI_ID=$UMI_ID" >> "$GITHUB_ENV"
+
+          UMI_PRIN_ID=$(az identity list --resource-group ${{ env.RESOURCE_GROUP }} --query [].principalId -o tsv)
+          echo The UMI_PRIN_ID is $UMI_PRIN_ID
+          echo "UMI_PRIN_ID=$UMI_PRIN_ID" >> "$GITHUB_ENV"
+
+      - name: Create AKS
+        run: |
+          az extension add --name aks-preview
+          az extension update --name aks-preview
+          az aks create --resource-group ${{ env.RESOURCE_GROUP }} --name ${{ env.CLUSTER_NAME }} --location ${{ env.LOCATION }} \
+                --node-count 1 --node-vm-size Standard_DS2_v2 --generate-ssh-keys --enable-oidc-issuer --node-osdisk-size 30 \
+                --node-osdisk-type Ephemeral --enable-workload-identity --assign-identity ${{ env.UMI_ID }}
+
+      - name: Create key vault
+        run: |
+          KV_NAME=$(echo $(date +%s%N) | sha256sum | head -c 10)
+          az keyvault create --name "kv$KV_NAME" --resource-group ${{ env.RESOURCE_GROUP }} --location ${{ env.LOCATION }} --enable-rbac-authorization
+          
+      - name: Get vault name
+        run: |
+          VAULT_NAME=$(az keyvault list --resource-group ${{ env.RESOURCE_GROUP }} --query [].name --output tsv)
+          echo The VAULT_NAME is $VAULT_NAME
+          echo "VAULT_NAME=$VAULT_NAME" >> "$GITHUB_ENV"
+
+      - name: Set RBAC on key vault
+        run: |
+          az role assignment create \
+              --role "Key Vault Administrator" \
+              --assignee ${{ env.KEYVAULT_ADMINS_OBJ_ID }} \
+              --scope "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/"${{ env.RESOURCE_GROUP }}"/providers/Microsoft.KeyVault/vaults/${{ env.VAULT_NAME }}"
+          az role assignment create \
+              --role "Key Vault Administrator" \
+              --assignee-object-id ${{ env.UMI_PRIN_ID }} --assignee-principal-type ServicePrincipal \
+              --scope "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/"${{ env.RESOURCE_GROUP }}"/providers/Microsoft.KeyVault/vaults/${{ env.VAULT_NAME }}"
+
+      - name: Get Oidc issuer URL
+        run: |
+          export AKS_OIDC_ISSUER=$(az aks show --name ${{ env.CLUSTER_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --query "oidcIssuerProfile.issuerUrl" -otsv)
+          echo The OIDC issuer url is $AKS_OIDC_ISSUER
+          echo "AKS_OIDC_ISSUER=$AKS_OIDC_ISSUER" >> "$GITHUB_ENV"
+    
+      - name: Setup Federated Identity
+        run: |
+          az identity federated-credential create --name ratify-federated-credential --identity-name ${{ env.USER_MANAGED_ID_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} \
+            --subject system:serviceaccount:gatekeeper-system:ratify-admin --issuer ${{ env.AKS_OIDC_ISSUER }}
+
+      - name: Create Container registry
+        run: |
+          az acr create --name ${{ env.REGISTRY_NAME }} --resource-group ${{ env.RESOURCE_GROUP }} --sku Standard
+
+      - name: Set RBAC on Container registry
+        run: |
+          az role assignment create \
+            --role "AcrPull" \
+            --assignee-object-id ${{ env.UMI_PRIN_ID }} --assignee-principal-type ServicePrincipal \
+            --scope "/subscriptions/${{ secrets.AZURE_SUBSCRIPTION_ID }}/resourceGroups/${{ env.RESOURCE_GROUP }}/providers/Microsoft.ContainerRegistry/registries/${{ env.REGISTRY_NAME }}"
+
+      - name: "Create self-signed certificate Notation"
+        run: |
+          cd files
+          az keyvault certificate create --name ${{ env.CERT_NAME }} --policy @selfSignedPolicy.json --vault-name ${{ env.VAULT_NAME }}
+          keyID=$(az keyvault certificate show --name ${{ env.CERT_NAME }} --vault-name ${{ env.VAULT_NAME }} --query 'kid' -o tsv)
+          echo The key identifier is $keyID
